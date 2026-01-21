@@ -5,6 +5,7 @@ import logging
 import random
 import re
 import time
+import threading
 from typing import Set, List, Optional, Callable, Union
 
 from .exceptions import ScheduleError, ScheduleValueError, IntervalError, CancelJob
@@ -61,6 +62,7 @@ class Job:
         self.tags: Set[Hashable] = set()  # unique set of tags for the job
         self.scheduler: Optional['Scheduler'] = scheduler  # scheduler to register with
         self.paused: bool = False  # flag indicating if the job is paused
+        self._lock = threading.RLock()  # 为每个任务添加可重入锁，保护任务状态
 
     def __lt__(self, other) -> bool:
         """
@@ -486,8 +488,9 @@ class Job:
         """
         :return: ``True`` if the job should be run now.
         """
-        assert self.next_run is not None, "must run _schedule_next_run before"
-        return not self.paused and datetime.datetime.now() >= self.next_run
+        with self._lock:
+            assert self.next_run is not None, "must run _schedule_next_run before"
+            return not self.paused and datetime.datetime.now() >= self.next_run
 
     def run(self):
         """
@@ -501,69 +504,75 @@ class Job:
                  deadline is reached.
 
         """
-        if self._is_overdue(datetime.datetime.now()):
-            logger.debug("Cancelling job %s", self)
-            return CancelJob
+        # 检查任务是否过期
+        with self._lock:
+            if self._is_overdue(datetime.datetime.now()):
+                logger.debug("Cancelling job %s", self)
+                return CancelJob
 
+        # 执行任务，不持有锁，避免阻塞其他任务
         logger.debug("Running job %s", self)
         ret = self.job_func()
-        self.last_run = datetime.datetime.now()
-        self._schedule_next_run()
 
-        if self._is_overdue(self.next_run):
-            logger.debug("Cancelling job %s", self)
-            return CancelJob
-        return ret
+        # 更新任务状态
+        with self._lock:
+            self.last_run = datetime.datetime.now()
+            self._schedule_next_run()
+
+            if self._is_overdue(self.next_run):
+                logger.debug("Cancelling job %s", self)
+                return CancelJob
+            return ret
 
     def _schedule_next_run(self) -> None:
         """
         Compute the instant when this job should run next.
         """
-        if self.unit not in ("milliseconds", "seconds", "minutes", "hours", "days", "weeks"):
-            raise ScheduleValueError(
-                "Invalid unit (valid units are `milliseconds`, `seconds`, `minutes`, `hours`, "
-                "`days`, and `weeks`)"
+        with self._lock:
+            if self.unit not in ("milliseconds", "seconds", "minutes", "hours", "days", "weeks"):
+                raise ScheduleValueError(
+                    "Invalid unit (valid units are `milliseconds`, `seconds`, `minutes`, `hours`, "
+                    "`days`, and `weeks`)")
+            if self.latest is not None:
+                if not (self.latest >= self.interval):
+                    raise ScheduleError("`latest` is greater than `interval`")
+                interval = random.randint(self.interval, self.latest)
+            else:
+                interval = self.interval
+
+            # Do all computation in the context of the requested timezone
+            now = datetime.datetime.now(self.at_time_zone)
+
+            next_run = now
+
+            if self.start_day is not None:
+                if self.unit != "weeks":
+                    raise ScheduleValueError("`unit` should be 'weeks'")
+                next_run = _move_to_next_weekday(next_run, self.start_day)
+
+            if self.at_time is not None:
+                next_run = self._move_to_at_time(next_run)
+
+            period = datetime.timedelta(**{self.unit: interval})
+            if interval != 1:
+                next_run += period
+
+            while next_run <= now:
+                next_run += period
+
+            next_run = self._correct_utc_offset(
+                next_run, fixate_time=(self.at_time is not None)
             )
-        if self.latest is not None:
-            if not (self.latest >= self.interval):
-                raise ScheduleError("`latest` is greater than `interval`")
-            interval = random.randint(self.interval, self.latest)
-        else:
-            interval = self.interval
 
-        # Do all computation in the context of the requested timezone
-        now = datetime.datetime.now(self.at_time_zone)
+            # To keep the api consistent with older versions, we have to set the 'next_run' to a naive timestamp in the local timezone.
+            # Because we want to stay backwards compatible with older versions.
+            if self.at_time_zone is not None:
+                # Convert back to the local timezone
+                next_run = next_run.astimezone()
 
-        next_run = now
+                next_run = next_run.replace(tzinfo=None)
 
-        if self.start_day is not None:
-            if self.unit != "weeks":
-                raise ScheduleValueError("`unit` should be 'weeks'")
-            next_run = _move_to_next_weekday(next_run, self.start_day)
-
-        if self.at_time is not None:
-            next_run = self._move_to_at_time(next_run)
-
-        period = datetime.timedelta(**{self.unit: interval})
-        if interval != 1:
-            next_run += period
-
-        while next_run <= now:
-            next_run += period
-
-        next_run = self._correct_utc_offset(
-            next_run, fixate_time=(self.at_time is not None)
-        )
-
-        # To keep the api consistent with older versions, we have to set the 'next_run' to a naive timestamp in the local timezone.
-        # Because we want to stay backwards compatible with older versions.
-        if self.at_time_zone is not None:
-            # Convert back to the local timezone
-            next_run = next_run.astimezone()
-
-            next_run = next_run.replace(tzinfo=None)
-
-        self.next_run = next_run
+            self.next_run = next_run
 
     def _move_to_at_time(self, moment: datetime.datetime) -> datetime.datetime:
         """
@@ -653,9 +662,10 @@ class Job:
         
         :return: The invoked job instance
         """
-        self.paused = True
-        logger.debug("Pausing job %s", self)
-        return self
+        with self._lock:
+            self.paused = True
+            logger.debug("Pausing job %s", self)
+            return self
 
     def resume(self) -> 'Job':
         """
@@ -663,12 +673,14 @@ class Job:
         
         :return: The invoked job instance
         """
-        self.paused = False
-        logger.debug("Resuming job %s", self)
-        return self
+        with self._lock:
+            self.paused = False
+            logger.debug("Resuming job %s", self)
+            return self
 
     def is_paused(self) -> bool:
         """
         :return: ``True`` if the job is currently paused.
         """
-        return self.paused
+        with self._lock:
+            return self.paused
