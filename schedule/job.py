@@ -60,6 +60,7 @@ class Job:
 
         self.tags: Set[Hashable] = set()  # unique set of tags for the job
         self.scheduler: Optional['Scheduler'] = scheduler  # scheduler to register with
+        self.paused: bool = False  # flag indicating if the job is paused
 
     def __lt__(self, other) -> bool:
         """
@@ -486,7 +487,7 @@ class Job:
         :return: ``True`` if the job should be run now.
         """
         assert self.next_run is not None, "must run _schedule_next_run before"
-        return datetime.datetime.now() >= self.next_run
+        return not self.paused and datetime.datetime.now() >= self.next_run
 
     def run(self):
         """
@@ -645,3 +646,29 @@ class Job:
             except ValueError:
                 pass
         return None
+
+    def pause(self) -> 'Job':
+        """
+        Pause the job, preventing it from running until resumed.
+        
+        :return: The invoked job instance
+        """
+        self.paused = True
+        logger.debug("Pausing job %s", self)
+        return self
+
+    def resume(self) -> 'Job':
+        """
+        Resume a paused job, allowing it to run again.
+        
+        :return: The invoked job instance
+        """
+        self.paused = False
+        logger.debug("Resuming job %s", self)
+        return self
+
+    def is_paused(self) -> bool:
+        """
+        :return: ``True`` if the job is currently paused.
+        """
+        return self.paused
