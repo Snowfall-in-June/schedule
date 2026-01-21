@@ -5,6 +5,8 @@ import logging
 import random
 import re
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import Set, List, Optional, Callable, Union
 
 from .exceptions import ScheduleError, ScheduleValueError, IntervalError, CancelJob
@@ -20,8 +22,10 @@ class Scheduler:
     handle their execution.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, max_workers: Optional[int] = None) -> None:
         self.jobs: List[Job] = []
+        self._lock = threading.RLock()  # 使用可重入锁，支持嵌套调用
+        self._executor = ThreadPoolExecutor(max_workers=max_workers)  # 线程池用于异步执行任务
 
     def run_pending(self) -> None:
         """
@@ -33,9 +37,27 @@ class Scheduler:
         in one hour increments then your job won't be run 60 times in
         between but only once.
         """
-        runnable_jobs = (job for job in self.jobs if job.should_run)
-        for job in sorted(runnable_jobs):
-            self._run_job(job)
+        with self._lock:
+            # 复制一份任务列表，避免在迭代过程中修改原列表
+            jobs_copy = self.jobs.copy()
+        
+        # 筛选可运行的任务
+        runnable_jobs = []
+        for job in jobs_copy:
+            if job.should_run:
+                runnable_jobs.append(job)
+        
+        # 按照下次运行时间排序
+        runnable_jobs.sort()
+        
+        # 执行可运行的任务
+        for job in runnable_jobs:
+            # 再次检查任务是否应该运行，因为可能在排序过程中已经被其他线程执行
+            with self._lock:
+                if job in self.jobs:
+                    # 再次检查任务状态，确保任务仍然需要运行
+                    if job.should_run:
+                        self._run_job(job)
 
     def run_all(self, delay_seconds: int = 0) -> None:
         """
@@ -47,13 +69,18 @@ class Scheduler:
 
         :param delay_seconds: A delay added between every executed job
         """
-        logger.debug(
-            "Running *all* %i jobs with %is delay in between",
-            len(self.jobs),
-            delay_seconds,
-        )
-        for job in self.jobs[:]:
-            self._run_job(job)
+        with self._lock:
+            jobs_copy = self.jobs.copy()
+            logger.debug(
+                "Running *all* %i jobs with %is delay in between",
+                len(jobs_copy),
+                delay_seconds,
+            )
+        
+        for job in jobs_copy:
+            with self._lock:
+                if job in self.jobs:
+                    self._run_job(job)
             time.sleep(delay_seconds)
 
     def get_jobs(self, tag: Optional[Hashable] = None) -> List[Job]:
@@ -64,10 +91,11 @@ class Scheduler:
         :param tag: An identifier used to identify a subset of
                     jobs to retrieve
         """
-        if tag is None:
-            return self.jobs[:]
-        else:
-            return [job for job in self.jobs if tag in job.tags]
+        with self._lock:
+            if tag is None:
+                return self.jobs[:]
+            else:
+                return [job for job in self.jobs if tag in job.tags]
 
     def clear(self, tag: Optional[Hashable] = None) -> None:
         """
@@ -77,12 +105,13 @@ class Scheduler:
         :param tag: An identifier used to identify a subset of
                     jobs to delete
         """
-        if tag is None:
-            logger.debug("Deleting *all* jobs")
-            del self.jobs[:]
-        else:
-            logger.debug('Deleting all jobs tagged "%s"', tag)
-            self.jobs[:] = (job for job in self.jobs if tag not in job.tags)
+        with self._lock:
+            if tag is None:
+                logger.debug("Deleting *all* jobs")
+                del self.jobs[:]
+            else:
+                logger.debug('Deleting all jobs tagged "%s"', tag)
+                self.jobs[:] = [job for job in self.jobs if tag not in job.tags]
 
     def cancel_job(self, job: Job) -> None:
         """
@@ -90,11 +119,12 @@ class Scheduler:
 
         :param job: The job to be unscheduled
         """
-        try:
-            logger.debug('Cancelling job "%s"', str(job))
-            self.jobs.remove(job)
-        except ValueError:
-            logger.debug('Cancelling not-scheduled job "%s"', str(job))
+        with self._lock:
+            try:
+                logger.debug('Cancelling job "%s"', str(job))
+                self.jobs.remove(job)
+            except ValueError:
+                logger.debug('Cancelling not-scheduled job "%s"', str(job))
 
     def every(self, interval: int = 1) -> Job:
         """
@@ -107,9 +137,20 @@ class Scheduler:
         return job
 
     def _run_job(self, job: Job) -> None:
-        ret = job.run()
-        if isinstance(ret, CancelJob) or ret is CancelJob:
-            self.cancel_job(job)
+        """
+        异步执行任务，避免阻塞调度过程
+        """
+        def job_wrapper():
+            """
+            任务执行包装器，处理任务执行结果
+            """
+            ret = job.run()
+            if isinstance(ret, CancelJob) or ret is CancelJob:
+                with self._lock:
+                    self.cancel_job(job)
+        
+        # 将任务提交到线程池执行
+        self._executor.submit(job_wrapper)
 
     def get_next_run(
         self, tag: Optional[Hashable] = None
@@ -122,12 +163,13 @@ class Scheduler:
         :return: A :class:`~datetime.datetime` object
                  or None if no jobs scheduled
         """
-        if not self.jobs:
-            return None
-        jobs_filtered = self.get_jobs(tag)
-        if not jobs_filtered:
-            return None
-        return min(jobs_filtered).next_run
+        with self._lock:
+            if not self.jobs:
+                return None
+            jobs_filtered = self.get_jobs(tag)
+            if not jobs_filtered:
+                return None
+            return min(jobs_filtered).next_run
 
     next_run = property(get_next_run)
 
@@ -138,6 +180,16 @@ class Scheduler:
                  :meth:`next_run <Scheduler.next_run>`
                  or None if no jobs are scheduled
         """
-        if not self.next_run:
+        next_run = self.next_run
+        if not next_run:
             return None
-        return (self.next_run - datetime.datetime.now()).total_seconds()
+        return (next_run - datetime.datetime.now()).total_seconds()
+    
+    def shutdown(self, wait: bool = True) -> None:
+        """
+        关闭线程池，释放资源
+        
+        :param wait: 是否等待所有任务执行完成
+        """
+        logger.debug("Shutting down thread pool")
+        self._executor.shutdown(wait=wait)
