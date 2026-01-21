@@ -123,3 +123,12 @@ def repeat(job, *args, **kwargs):
         return decorated_function
 
     return _schedule_decorator
+
+
+def shutdown(wait: bool = True) -> None:
+    """
+    Shutdown the default scheduler's thread pool executor.
+
+    :param wait: If True, wait for all running tasks to complete before shutting down.
+    """
+    default_scheduler.shutdown(wait=wait)
